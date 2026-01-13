@@ -25,3 +25,4 @@ LIMITATIONS
 
 Currently this only works for an Uma's signature racewear. I plan to update this in the future.
 Some textures may or may not be working in this version as I continue to tweak the script.
+This script will also not apply an outline and must be done manually if desired.
