@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Uma Material Tool",
     "author": "Gvt5036",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Uma Tool",
     "description": "Automates LooperHonstropy's Umamusume material setup and renaming.",
@@ -10,9 +10,10 @@ bl_info = {
 
 import bpy
 import os
+import re
 
 # ------------------------------------------------------------------------
-#   Preferences to store Texture Directory
+#   Preferences
 # ------------------------------------------------------------------------
 class UmaToolPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
@@ -28,7 +29,7 @@ class UmaToolPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "texture_dir")
 
 # ------------------------------------------------------------------------
-#   Core Script
+#   Core Logic
 # ------------------------------------------------------------------------
 class UMA_OT_ApplyMaterials(bpy.types.Operator):
     """Apply and Rename Uma Materials"""
@@ -36,11 +37,9 @@ class UMA_OT_ApplyMaterials(bpy.types.Operator):
     bl_label = "Apply/Rename Materials"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # Operator properties (inputs for the popup)
     uma_number: bpy.props.StringProperty(name="Uma Number", default="")
     uma_name: bpy.props.StringProperty(name="Uma Name", default="")
     
-    # We reproduce the texture dir here so it can be edited in the popup
     texture_dir_override: bpy.props.StringProperty(
         name="Texture Directory", 
         subtype='DIR_PATH',
@@ -48,11 +47,9 @@ class UMA_OT_ApplyMaterials(bpy.types.Operator):
     )
 
     def invoke(self, context, event):
-        # Load default directory from preferences if available
         prefs = context.preferences.addons[__name__].preferences
         if prefs.texture_dir and not self.texture_dir_override:
             self.texture_dir_override = prefs.texture_dir
-            
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context):
@@ -62,9 +59,7 @@ class UMA_OT_ApplyMaterials(bpy.types.Operator):
         layout.prop(self, "uma_name")
 
     def execute(self, context):
-        # 1. Validation
         tex_path = self.texture_dir_override
-        # Save path back to preferences for convenience
         prefs = context.preferences.addons[__name__].preferences
         prefs.texture_dir = tex_path
         
@@ -76,14 +71,6 @@ class UMA_OT_ApplyMaterials(bpy.types.Operator):
             self.report({'ERROR'}, "Please enter both Uma Number and Name.")
             return {'CANCELLED'}
 
-        # Find source object
-        source_obj_name = "Icosphere of Materials"
-        if source_obj_name not in bpy.data.objects:
-            self.report({'ERROR'}, f"Object '{source_obj_name}' not found in project.")
-            return {'CANCELLED'}
-        
-        source_obj = bpy.data.objects[source_obj_name]
-        
         # Get Source Materials
         src_mat_shader = bpy.data.materials.get("Uma Shader")
         src_mat_eyes = bpy.data.materials.get("Uma Eyes")
@@ -92,197 +79,259 @@ class UMA_OT_ApplyMaterials(bpy.types.Operator):
             self.report({'ERROR'}, "Source materials 'Uma Shader' or 'Uma Eyes' missing.")
             return {'CANCELLED'}
 
-        # Get Target Object
         target_obj = context.active_object
         if not target_obj or not target_obj.material_slots:
             self.report({'ERROR'}, "Please select a model with materials.")
             return {'CANCELLED'}
 
-        # 2. Iterate Slots
+        # ---------------------------------------------------------
+        # 1. Apply & Rename Materials
+        # ---------------------------------------------------------
         for slot in target_obj.material_slots:
-            if not slot.material:
-                continue
+            if not slot.material: continue
             
             old_name = slot.material.name.lower()
             num = self.uma_number
             name = self.uma_name
             
             new_mat = None
-            part_type = None
-
-            # ----------------------------------------------------------------
-            #   Identify Part & Rename
-            # ----------------------------------------------------------------
             
-            # CHECK: BODY
+            # --- BODY ---
             if f"bdy{num}" in old_name:
-                part_type = "Body"
                 new_mat = src_mat_shader.copy()
                 new_mat.name = f"{name} Body"
-                
-                self.setup_textures(new_mat, tex_path, num, part="Body")
+                self.setup_standard_textures(new_mat, tex_path, num, "Body")
 
-            # CHECK: FACE
+            # --- FACE ---
             elif f"chr{num}" in old_name and "face" in old_name:
-                part_type = "Face"
                 new_mat = src_mat_shader.copy()
                 new_mat.name = f"{name} Face"
-                
-                self.setup_textures(new_mat, tex_path, num, part="Face")
-                
-                # Toggle Face Param
+                self.setup_standard_textures(new_mat, tex_path, num, "Face")
                 self.set_face_toggle(new_mat)
 
-            # CHECK: HAIR
+            # --- HAIR ---
             elif f"chr{num}" in old_name and "hair" in old_name:
-                part_type = "Hair"
                 new_mat = src_mat_shader.copy()
                 new_mat.name = f"{name} Hair"
-                
-                self.setup_textures(new_mat, tex_path, num, part="Hair")
+                self.setup_standard_textures(new_mat, tex_path, num, "Hair")
 
-            # CHECK: TAIL
+            # --- TAIL ---
             elif "tail" in old_name:
-                # Tail logic: usually matches if it's a tail material, usually 'tail' is enough context
-                # but we check if it follows general tail naming patterns provided
-                part_type = "Tail"
                 new_mat = src_mat_shader.copy()
                 new_mat.name = f"{name} Tail"
-                
-                self.setup_textures(new_mat, tex_path, num, part="Tail")
+                self.setup_standard_textures(new_mat, tex_path, num, "Tail")
 
-            # CHECK: EYE
+            # --- EYE ---
             elif "eye" in old_name:
-                part_type = "Eye"
-                new_mat = src_mat_eyes.copy() # Copy Uma Eyes
+                new_mat = src_mat_eyes.copy()
                 new_mat.name = f"{name} Eye"
-                # No texture setup for eyes requested
+                self.setup_eye_textures(new_mat, tex_path, num)
 
-            # ----------------------------------------------------------------
-            #   Apply Material to Slot
-            # ----------------------------------------------------------------
             if new_mat:
                 slot.material = new_mat
-            
-        # 3. Cleanup unused materials
-        # Simple cleanup: iterate all materials, if users == 0, remove. 
-        # (Be careful with this, normally blender cleans up on reload, 
-        # but we can force it if explicitly requested).
-        for mat in bpy.data.materials:
-            if mat.users == 0:
-                bpy.data.materials.remove(mat)
 
-        self.report({'INFO'}, "Materials Updated Successfully.")
+        # ---------------------------------------------------------
+        # 2. Cleanup Duplicates
+        # ---------------------------------------------------------
+        self.cleanup_materials(target_obj, self.uma_name)
+
+        self.report({'INFO'}, "Materials Updated & Cleaned.")
         return {'FINISHED'}
 
+    # ---------------------------------------------------------
+    #   Logic Helpers
+    # ---------------------------------------------------------
+
     def set_face_toggle(self, mat):
-        """Finds 'Toggle If Face' node/value and sets it to 1"""
+        """Finds 'Toggle If Face' input in the shader group and sets it to 1"""
         if not mat.use_nodes: return
         
-        # Method 1: Look for a Value Node with that label
+        # Iterate all nodes to find the main Group node (usually "Uma Shader" or similar)
+        # We search for a node that HAS an input named "Toggle If Face..."
         for node in mat.node_tree.nodes:
-            if "Toggle If Face" in node.label or "Toggle If Face" in node.name:
-                if hasattr(node.outputs[0], 'default_value'):
-                    node.outputs[0].default_value = 1.0
-                    return
-        
-        # Method 2: If it's a Group Input (if the logic is inside a group)
-        # Note: Since the prompt implies editing the shader directly, 
-        # we check mostly for Value nodes or Group Inputs.
+            if node.type == 'GROUP':
+                # Check inputs of this group node
+                for input_socket in node.inputs:
+                    if "toggle if face" in input_socket.name.lower():
+                        input_socket.default_value = 1.0
+                        return
 
-    def setup_textures(self, mat, directory, num, part):
-        """Finds texture nodes in frames and assigns images"""
+    def load_image(self, directory, filename, colorspace):
+        """Helper to safely load an image and set colorspace"""
+        filepath = os.path.join(directory, filename)
+        if not os.path.exists(filepath):
+            print(f"File missing: {filename}")
+            return None
+        try:
+            img = bpy.data.images.load(filepath)
+            try:
+                img.colorspace_settings.name = colorspace
+            except:
+                pass
+            return img
+        except:
+            return None
+
+    def setup_standard_textures(self, mat, directory, num, part):
+        """Handles Body, Face, Hair, Tail based on Node Frames"""
         if not mat.use_nodes: return
 
-        # Define filenames based on part
         files = {}
-        
         if part == "Body":
-            files['Base'] = f"tex_bdy{num}_00_base.png"
-            files['Ctrl'] = f"tex_bdy{num}_00_ctrl.png"
-            files['Shaded'] = f"tex_bdy{num}_00_shad_c.png"
-            files['Diffuse'] = f"tex_bdy{num}_00_diff.png"
-            
+            files = {
+                'Base': f"tex_bdy{num}_00_base.png",
+                'Ctrl': f"tex_bdy{num}_00_ctrl.png",
+                'Shaded': f"tex_bdy{num}_00_shad_c.png",
+                'Diffuse': f"tex_bdy{num}_00_diff.png"
+            }
         elif part == "Face":
-            files['Base'] = f"tex_chr{num}_00_face_base.png"
-            files['Ctrl'] = f"tex_chr{num}_00_face_ctrl.png"
-            files['Shaded'] = f"tex_chr{num}_00_face_shad_c.png"
-            files['Diffuse'] = f"tex_chr{num}_00_face_diff.png"
-            
+            files = {
+                'Base': f"tex_chr{num}_00_face_base.png",
+                'Ctrl': f"tex_chr{num}_00_face_ctrl.png",
+                'Shaded': f"tex_chr{num}_00_face_shad_c.png",
+                'Diffuse': f"tex_chr{num}_00_face_diff.png"
+            }
         elif part == "Hair":
-            files['Base'] = f"tex_chr{num}_00_hair_base.png"
-            files['Ctrl'] = f"tex_chr{num}_00_hair_ctrl.png"
-            files['Shaded'] = f"tex_chr{num}_00_hair_shad_c.png"
-            files['Diffuse'] = f"tex_chr{num}_00_hair_diff.png"
-            
+            files = {
+                'Base': f"tex_chr{num}_00_hair_base.png",
+                'Ctrl': f"tex_chr{num}_00_hair_ctrl.png",
+                'Shaded': f"tex_chr{num}_00_hair_shad_c.png",
+                'Diffuse': f"tex_chr{num}_00_hair_diff.png"
+            }
         elif part == "Tail":
-            # Tail Exception logic
-            files['Base'] = "tex_tail0001_00_0000_base.png"
-            files['Ctrl'] = "tex_tail0001_00_0000_ctrl.png"
-            files['Shaded'] = f"tex_tail0001_00_{num}_shad_c.png"
-            files['Diffuse'] = f"tex_tail0001_00_{num}_diff.png"
+            files = {
+                'Base': "tex_tail0001_00_0000_base.png",
+                'Ctrl': "tex_tail0001_00_0000_ctrl.png",
+                'Shaded': f"tex_tail0001_00_{num}_shad_c.png",
+                'Diffuse': f"tex_tail0001_00_{num}_diff.png"
+            }
 
-        # Helper to load image
-        def load_image(filename, colorspace):
-            filepath = os.path.join(directory, filename)
-            if not os.path.exists(filepath):
-                print(f"Warning: File not found: {filename}")
-                return None
-            
-            try:
-                img = bpy.data.images.load(filepath)
-                # Set Colorspace
-                try:
-                    img.colorspace_settings.name = colorspace
-                except TypeError:
-                    print(f"Colorspace '{colorspace}' not found, defaulting.")
-                return img
-            except:
-                return None
-
-        # Search Nodes
-        # We look for nodes that are CHILDREN of a Frame Node with specific labels
-        
-        nodes = mat.node_tree.nodes
-        
-        for node in nodes:
+        for node in mat.node_tree.nodes:
             if node.type == 'TEX_IMAGE' and node.parent:
-                frame_label = node.parent.label.lower()
+                label = node.parent.label.lower()
                 
-                target_key = None
-                target_cs = "sRGB" # Default fallback
+                target = None
+                cs = "sRGB"
                 
-                if "base texture" in frame_label:
-                    target_key = 'Base'
-                    target_cs = "Non-Color"
-                elif "ctrl texture" in frame_label:
-                    target_key = 'Ctrl'
-                    target_cs = "Non-Color"
-                elif "shaded" in frame_label:
-                    target_key = 'Shaded'
-                    target_cs = "ACES 2.0 sRGB"
-                elif "diffuse" in frame_label:
-                    target_key = 'Diffuse'
-                    target_cs = "ACES 2.0 sRGB"
+                if "base texture" in label:
+                    target = 'Base'
+                    cs = "Non-Color"
+                elif "ctrl texture" in label:
+                    target = 'Ctrl'
+                    cs = "Non-Color"
+                elif "shaded" in label:
+                    target = 'Shaded'
+                    cs = "ACES 2.0 sRGB"
+                elif "diffuse" in label:
+                    target = 'Diffuse'
+                    cs = "ACES 2.0 sRGB"
                 
-                if target_key:
-                    img = load_image(files[target_key], target_cs)
-                    if img:
-                        node.image = img
+                if target:
+                    img = self.load_image(directory, files[target], cs)
+                    if img: node.image = img
 
-# ------------------------------------------------------------------------
-#   UI Panel
-# ------------------------------------------------------------------------
-class VIEW3D_PT_UmaPanel(bpy.types.Panel):
-    bl_label = "Uma Tool"
-    bl_idname = "VIEW3D_PT_uma_tool"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Uma Tool"
+    def setup_eye_textures(self, mat, directory, num):
+        """Handles the Eye Logic: 3 UV-linked textures (sorted Y) + 1 unconnected texture"""
+        if not mat.use_nodes: return
+        
+        # 1. Find all Image Nodes
+        img_nodes = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE']
+        
+        uv_linked_nodes = []
+        unconnected_nodes = []
+        
+        # 2. Check connections
+        for node in img_nodes:
+            is_connected_to_uv = False
+            # Check inputs[0] (Vector). If it has a link, traverse back to see if it hits a UV Map or Mapping node
+            if node.inputs[0].is_linked:
+                # We assume if it has input, it's the UV ones. 
+                # The user said "3 image textures coming from a UV node" vs "1 not connected"
+                is_connected_to_uv = True
+            
+            if is_connected_to_uv:
+                uv_linked_nodes.append(node)
+            else:
+                unconnected_nodes.append(node)
+                
+        # 3. Sort UV nodes Top-Down (Higher Y is top)
+        uv_linked_nodes.sort(key=lambda n: n.location.y, reverse=True)
+        
+        # 4. Assign Textures
+        # The 3 Highlights
+        eye_highs = [
+            f"tex_chr{num}_00_eyehi00.png",
+            f"tex_chr{num}_00_eyehi01.png",
+            f"tex_chr{num}_00_eyehi02.png"
+        ]
+        
+        for i, node in enumerate(uv_linked_nodes):
+            if i < 3:
+                img = self.load_image(directory, eye_highs[i], "sRGB") # Assuming sRGB for eyes unless specified otherwise
+                if img: node.image = img
+                
+        # The Main Eye (Unconnected)
+        eye_base_file = f"tex_chr{num}_eye0.png"
+        for node in unconnected_nodes:
+            # We pick the first unconnected one we find (should only be 1 based on prompt)
+            img = self.load_image(directory, eye_base_file, "sRGB")
+            if img: node.image = img
+            break
 
-    def draw(self, context):
-        layout = self.layout
-        layout.operator("object.uma_apply_materials")
+    def cleanup_materials(self, obj, uma_name):
+        """Removes duplicate slots for Body, Face, Eye, Hair, Tail"""
+        target_parts = ["Body", "Face", "Eye", "Hair", "Tail"]
+        
+        # We need to find the "Best" slot index for each part and list indices to remove
+        slots_to_keep = {} # { 'Body': slot_index, 'Face': slot_index ... }
+        slots_to_remove = []
+        
+        # 1. Map parts to slots
+        for i, slot in enumerate(obj.material_slots):
+            if not slot.material: continue
+            
+            mat_name = slot.material.name
+            
+            # check if this material belongs to one of our target parts
+            matched_part = None
+            for part in target_parts:
+                # Pattern: "[Uma Name] [Part]"
+                # We look for the exact start string provided in renaming
+                target_name_start = f"{uma_name} {part}"
+                
+                if mat_name.startswith(target_name_start):
+                    matched_part = part
+                    break
+            
+            if matched_part:
+                # Logic: If we haven't found a slot for this part yet, take this one.
+                # If we HAVE found one, check if the current one is "better" (shorter name, no .001)
+                # or if the existing one is "better".
+                
+                if matched_part not in slots_to_keep:
+                    slots_to_keep[matched_part] = i
+                else:
+                    # Compare current slot (i) vs stored slot (existing_i)
+                    existing_i = slots_to_keep[matched_part]
+                    existing_name = obj.material_slots[existing_i].material.name
+                    
+                    # Heuristic: The one WITHOUT numbers is better. 
+                    # Generally len("Name") < len("Name.001")
+                    if len(mat_name) < len(existing_name):
+                        # Found a better one, mark the old one for removal, keep new
+                        slots_to_remove.append(existing_i)
+                        slots_to_keep[matched_part] = i
+                    else:
+                        # Current one is worse (duplicate), mark for removal
+                        slots_to_remove.append(i)
+                        
+        # 2. Remove slots
+        # MUST delete in reverse index order to avoid shifting indices of subsequent items
+        slots_to_remove.sort(reverse=True)
+        
+        for i in slots_to_remove:
+            obj.active_material_index = i
+            bpy.ops.object.material_slot_remove()
 
 # ------------------------------------------------------------------------
 #   Registration
